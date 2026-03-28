@@ -462,7 +462,7 @@ function Row({
     typeof node.id === "string" &&
     (node.id === "sessions" || node.id.startsWith("sessions_"));
 
-  const isNonCurrencyValueRow = isUnitsRow || isSessionsRow;
+  const isNonCurrencyValueRow = isUnitsRow || isSessionsRow || isUnitSessionPctRow;
 
   const isRevenueTop = level === 0 && node.id === "revenue";
   const isAspTop = level === 0 && node.id === "asp";
@@ -539,7 +539,7 @@ function Row({
           >
             {Number.isFinite(v)
               ? isUnitSessionPctRow
-                ? `${v.toFixed(2)}%`
+                ? `${v.toFixed(1)}%`
                 : isNonCurrencyValueRow
                 ? formatUnits(v)
                 : isAspRow

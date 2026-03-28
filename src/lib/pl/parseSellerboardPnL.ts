@@ -76,8 +76,10 @@ function parseCsv(text: string): string[][] {
   }
 
   row.push(cell);
-  rows.push(row.map((x) => x.trim()));
-  return rows.filter((r) => r.some((x) => x.length > 0));
+  // Preserve leading whitespace in the label column (col 0) so we can detect
+  // indentation/parent-context later; trim everything else normally.
+  rows.push(row.map((x, i) => (i === 0 ? x.trimEnd() : x.trim())));
+  return rows.filter((r) => r.some((x) => x.trim().length > 0));
 }
 
 function toNum(s: string) {
@@ -181,12 +183,29 @@ export function parseSellerboardPnLCsv(text: string): ParsedPnL {
   if (keepStart < 0) throw new Error("Internal: could not align period columns");
 
   const lines: RawLine[] = [];
+  let currentParent = "";
   for (const r of rows.slice(1)) {
-    const name = r[0];
-    if (!name) continue;
+    const rawName = r[0];
+    if (!rawName?.trim()) continue;
+
+    const indented = /^\s/.test(rawName);
+    const trimmedName = rawName.trim();
+    const normalizedName = norm(trimmedName);
+
+    // Track the nearest non-indented row as the current parent section header.
+    if (!indented) currentParent = normalizedName;
+
+    // Preserve leading whitespace in the stored name so isIndented() in buildPlTree.ts
+    // can correctly identify indented children of "Sales" and "Units" blocks.
+    // Only override the name for explicit disambiguation cases.
+    let effectiveName = rawName;
+    if (normalizedName === "digital services fee" && currentParent === "refund cost") {
+      effectiveName = "digital services fee (refund cost)";
+    }
+
     const valsAll = r.slice(1).map((x) => (x ?? "").trim());
     const vals = valsAll.slice(keepStart, keepStart + 4).map(toNum);
-    lines.push({ name, values: vals });
+    lines.push({ name: effectiveName, values: vals });
   }
 
   // Revenue detection

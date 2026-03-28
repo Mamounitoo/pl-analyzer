@@ -99,8 +99,10 @@ const RULES: Record<string, Rule> = Object.fromEntries(
     ["fba per unit fulfilment fee", { action: "bucket", bucket: "pricing", subgroup: "amazon_fees" }],
     ["digital services fee", { action: "bucket", bucket: "pricing", subgroup: "amazon_fees" }],
     ["digital services fee fba", { action: "bucket", bucket: "pricing", subgroup: "amazon_fees" }],
-    ["fba fee (mcf)", { action: "bucket", bucket: "pricing", subgroup: "amazon_fees" }],
-    ["multi-channel", { action: "bucket", bucket: "pricing", subgroup: "amazon_fees" }],
+    // Disambiguated form: "Digital services fee" when indented under "Refund cost" in the CSV
+    ["digital services fee (refund cost)", { action: "bucket", bucket: "refunds" }],
+    ["fba fee (mcf)", { action: "bucket", bucket: "other" }],
+    ["multi-channel", { action: "bucket", bucket: "other" }],
 
     // ---- storage ----
     ["fba storage fee", { action: "bucket", bucket: "storage" }],
@@ -276,7 +278,7 @@ function extractRefundCostBlock(all: RawLine[]) {
       "promotion",
       "fba shipping chargeback",
       "ship promotion",
-      "digitalservicesfee",
+      "digital services fee (refund cost)",
       "gift wrap chargeback",
       "taxdiscount",
       "shippingtaxdiscount",
@@ -516,13 +518,6 @@ function buildSessionsNode(parsed: ParsedPnL): PlNode | null {
         values: s.mobile ?? ZEROS,
         pct: BLANKS,
       },
-      {
-        id: "unit_session_pct",
-        label: "Unit Session %",
-        kind: "line",
-        values: s.unitSessionPct ?? ZEROS,
-        pct: BLANKS,
-      },
       // last + integer values
       {
         id: "sessions_active_subs",
@@ -532,6 +527,18 @@ function buildSessionsNode(parsed: ParsedPnL): PlNode | null {
         pct: BLANKS,
       },
     ],
+  };
+}
+
+function buildUspNode(parsed: ParsedPnL): PlNode | null {
+  const s = (parsed as any).sessions;
+  if (!s?.unitSessionPct) return null;
+  return {
+    id: "unit_session_pct",
+    label: "Unit Session %",
+    kind: "line",
+    values: s.unitSessionPct,
+    pct: BLANKS,
   };
 }
 
@@ -676,6 +683,7 @@ export function buildPlTree(parsed: ParsedPnL): PlNode[] {
   const { refundLines, remaining: remainingNoVatNoRefunds } = extractRefundCostBlock(remainingNoVat);
 
   const sessionsNode = buildSessionsNode(parsed);
+  const uspNode = buildUspNode(parsed);
 
   // Buckets
   const byBucket: Record<BucketId, RawLine[]> = {
@@ -783,6 +791,7 @@ export function buildPlTree(parsed: ParsedPnL): PlNode[] {
 
   const tree: PlNode[] = [
     ...(sessionsNode ? [sessionsNode] : []),
+    ...(uspNode ? [uspNode] : []),
 
     grossRevenueNode,
     revenueNode,
