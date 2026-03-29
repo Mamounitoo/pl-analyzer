@@ -3,8 +3,8 @@ import type { PlPeriod } from "@/lib/pl/PlSessionContext";
 export type RawLine = { name: string; values: number[] };
 
 export type ParsedPnL = {
-  periods: PlPeriod[]; // length 4
-  revenue: number[]; // length 4
+  periods: PlPeriod[];
+  revenue: number[];
   lines: RawLine[];
   cadence: "week" | "month" | "period";
   sessions?: {
@@ -160,19 +160,19 @@ export function parseSellerboardPnLCsv(text: string): ParsedPnL {
 
   const header = rows[0];
   const periodHeadersAll = header.slice(1).filter(Boolean);
-  if (periodHeadersAll.length < 4) throw new Error("Could not detect period columns (need at least 4)");
+  if (periodHeadersAll.length < 1) throw new Error("Could not detect period columns");
 
   // Drop trailing Total column(s) if present
   let periodHeaders = [...periodHeadersAll];
-  while (periodHeaders.length > 4 && isTotalHeader(periodHeaders[periodHeaders.length - 1])) {
+  while (periodHeaders.length > 1 && isTotalHeader(periodHeaders[periodHeaders.length - 1])) {
     periodHeaders.pop();
   }
 
-  if (periodHeaders.length < 4) throw new Error("Not enough non-Total periods found (need 4)");
+  if (periodHeaders.length < 1) throw new Error("Not enough non-Total periods found");
 
-  // Sellerboard newest periods are on the LEFT in your file
-  const kept = periodHeaders.slice(0, 4);
-  const cadence = detectCadence(kept);
+  // Sellerboard newest periods are on the LEFT in your file; keep all of them
+  const kept = periodHeaders;
+  const cadence = detectCadence(kept.slice(0, 4));
 
   const periods: PlPeriod[] = kept.map((label, i) => ({
     key: `p${i}`,
@@ -204,7 +204,7 @@ export function parseSellerboardPnLCsv(text: string): ParsedPnL {
     }
 
     const valsAll = r.slice(1).map((x) => (x ?? "").trim());
-    const vals = valsAll.slice(keepStart, keepStart + 4).map(toNum);
+    const vals = valsAll.slice(keepStart, keepStart + kept.length).map(toNum);
     lines.push({ name: effectiveName, values: vals });
   }
 

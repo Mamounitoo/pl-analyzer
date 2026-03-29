@@ -8,8 +8,8 @@ export type PlNode = {
   id: string;
   label: string;
   kind: "line" | "subtotal";
-  values: number[]; // length 4
-  pct: number[]; // length 4 (0-1)
+  values: number[];
+  pct: number[]; // 0-1 fractions, same length as values
   status?: "good" | "watch" | "bad";
   flags?: string[];
   children?: PlNode[];

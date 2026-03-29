@@ -6,28 +6,26 @@ function norm(s: unknown) {
   return String(s ?? "").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
-const ZEROS = [0, 0, 0, 0];
-const BLANKS = [NaN, NaN, NaN, NaN];
-
-function sum4(lines: RawLine[]) {
-  const out = [0, 0, 0, 0];
-  for (const l of lines) for (let i = 0; i < 4; i++) out[i] += l.values[i] ?? 0;
-  return out;
-}
-
 function pctOfRevenue(values: number[], revenue: number[]) {
   return values.map((v, i) => (revenue[i] ? v / revenue[i] : NaN));
 }
 
-function abs4(values: number[]) {
+function absArr(values: number[]) {
   return values.map((v) => Math.abs(v ?? 0));
 }
 
-function int4(values: unknown) {
-  const arr = Array.isArray(values) ? (values as any[]) : ZEROS;
-  return [0, 1, 2, 3].map((i) => {
-    const n = Number(arr[i] ?? 0);
-    return Number.isFinite(n) ? Math.round(n) : 0;
+function sumN(lines: RawLine[], n: number): number[] {
+  const out = Array<number>(n).fill(0);
+  for (const l of lines) for (let i = 0; i < n; i++) out[i] += l.values[i] ?? 0;
+  return out;
+}
+
+function intN(values: unknown, n: number): number[] {
+  const zeros = Array<number>(n).fill(0);
+  const arr = Array.isArray(values) ? (values as number[]) : zeros;
+  return Array.from({ length: n }, (_, i) => {
+    const v = Number(arr[i] ?? 0);
+    return Number.isFinite(v) ? Math.round(v) : 0;
   });
 }
 
@@ -232,15 +230,378 @@ function applyBench(
   type: "grossMargin" | "refunds" | "promo" | "ads" | "storage",
   pctArr: number[]
 ) {
-  const n = tree.find((x) => x.label === label);
-  if (!n) return;
-  const p = pctArr[3];
-  n.status = statusFor(type, p);
-  n.flags = flagsFor(type, p);
+  const node = tree.find((x) => x.label === label);
+  if (!node) return;
+  // Index 0 = most recent period (newest-first ordering)
+  const p = pctArr[0];
+  node.status = statusFor(type, p);
+  node.flags = flagsFor(type, p);
 }
 
-function costGroup(id: string, label: string, lines: RawLine[], revenue: number[]): PlNode {
-  const total = sum4(lines);
+function dropAggregateVatLine(vatLines: RawLine[], n: number): RawLine[] {
+  if (vatLines.length < 3) return vatLines;
+
+  const absSumOthers = (idx: number) => {
+    const out = Array<number>(n).fill(0);
+    for (let i = 0; i < vatLines.length; i++) {
+      if (i === idx) continue;
+      const v = absArr(vatLines[i].values);
+      for (let k = 0; k < n; k++) out[k] += v[k] ?? 0;
+    }
+    return out;
+  };
+
+  const approxEq = (a: number[], b: number[], tol = 0.01) =>
+    a.every((av, i) => Math.abs((av ?? 0) - (b[i] ?? 0)) <= tol);
+
+  const candidates = vatLines
+    .map((l, idx) => ({ l, idx }))
+    .filter(({ l }) => norm(l.name) === "vat" && !isIndented(l.name));
+
+  for (const c of candidates) {
+    const cand = absArr(c.l.values);
+    const others = absSumOthers(c.idx);
+    if (approxEq(cand, others)) {
+      return vatLines.filter((_, i) => i !== c.idx);
+    }
+  }
+
+  for (let i = 0; i < vatLines.length; i++) {
+    const cand = absArr(vatLines[i].values);
+    const others = absSumOthers(i);
+    if (approxEq(cand, others)) {
+      return vatLines.filter((_, j) => j !== i);
+    }
+  }
+
+  return vatLines;
+}
+
+function buildVatNode(vatLines: RawLine[], netRevenue: number[], n: number): PlNode {
+  const filtered = dropAggregateVatLine(vatLines, n);
+  const totalRaw = sumN(filtered, n);
+  const total = absArr(totalRaw);
+
+  return {
+    id: "vat",
+    label: "VAT",
+    kind: "line",
+    values: total,
+    pct: pctOfRevenue(total, netRevenue),
+    children: filtered.map((l, idx) => ({
+      id: `vat_${idx}`,
+      label: l.name,
+      kind: "line",
+      values: absArr(l.values),
+      pct: pctOfRevenue(absArr(l.values), netRevenue),
+    })),
+  };
+}
+
+function buildGrossRevenueNode(
+  grossRevenue: number[],
+  netRevenue: number[],
+  vatNode: PlNode,
+  n: number
+): PlNode {
+  const blanks = Array<number>(n).fill(NaN);
+  return {
+    id: "gross_revenue",
+    label: "Gross Revenue",
+    kind: "line",
+    values: grossRevenue,
+    pct: blanks,
+    children: [
+      {
+        id: "gross_revenue_net",
+        label: "Net Revenue",
+        kind: "line",
+        values: netRevenue,
+        pct: pctOfRevenue(netRevenue, netRevenue),
+      },
+      vatNode,
+    ],
+  };
+}
+
+function scale(values: number[], factors: number[]) {
+  return values.map((v, i) => (Number.isFinite(v) ? v * (factors[i] ?? 0) : 0));
+}
+
+function buildRevenueNode(
+  netRevenue: number[],
+  salesChildrenGross: RawLine[],
+  grossRevenue: number[],
+  n: number
+): PlNode {
+  const zeros = Array<number>(n).fill(0);
+  const blanks = Array<number>(n).fill(NaN);
+
+  // Scale gross breakdown children to net revenue per period
+  const factors = grossRevenue.map((g, i) => {
+    const gg = g ?? 0;
+    const nn = netRevenue[i] ?? 0;
+    return gg ? nn / gg : 0;
+  });
+
+  const organic = pickOrganic(salesChildrenGross);
+  const sp = pickSponsored(salesChildrenGross, "products");
+  const sb = pickSponsored(salesChildrenGross, "brands");
+  const sd = pickSponsored(salesChildrenGross, "display");
+
+  const direct = pickDirectSales(salesChildrenGross);
+  const subscription = pickSubscriptionSales(salesChildrenGross);
+
+  const pctRev = pctOfRevenue(netRevenue, netRevenue);
+
+  const orgPaidBucket: PlNode = {
+    id: "rev_org_paid_bucket",
+    label: "Organic / Paid",
+    kind: "line",
+    values: blanks,
+    pct: blanks,
+    children: [
+      {
+        id: "rev_organic",
+        label: "Organic",
+        kind: "line",
+        values: organic ? scale(organic.values, factors) : zeros,
+        pct: organic ? pctOfRevenue(scale(organic.values, factors), netRevenue) : pctOfRevenue(zeros, netRevenue),
+      },
+      {
+        id: "rev_sp",
+        label: "Sponsored Products",
+        kind: "line",
+        values: sp ? scale(sp.values, factors) : zeros,
+        pct: sp ? pctOfRevenue(scale(sp.values, factors), netRevenue) : pctOfRevenue(zeros, netRevenue),
+      },
+      {
+        id: "rev_sb",
+        label: "Sponsored Brands",
+        kind: "line",
+        values: sb ? scale(sb.values, factors) : zeros,
+        pct: sb ? pctOfRevenue(scale(sb.values, factors), netRevenue) : pctOfRevenue(zeros, netRevenue),
+      },
+      {
+        id: "rev_sd",
+        label: "Sponsored Display",
+        kind: "line",
+        values: sd ? scale(sd.values, factors) : zeros,
+        pct: sd ? pctOfRevenue(scale(sd.values, factors), netRevenue) : pctOfRevenue(zeros, netRevenue),
+      },
+    ],
+  };
+
+  const dirSubBucket: PlNode = {
+    id: "rev_dir_sub_bucket",
+    label: "Direct / Subscription",
+    kind: "line",
+    values: blanks,
+    pct: blanks,
+    children: [
+      {
+        id: "rev_direct",
+        label: "Direct",
+        kind: "line",
+        values: direct ? scale(direct.values, factors) : zeros,
+        pct: direct ? pctOfRevenue(scale(direct.values, factors), netRevenue) : pctOfRevenue(zeros, netRevenue),
+      },
+      {
+        id: "rev_subscription",
+        label: "Subscription",
+        kind: "line",
+        values: subscription ? scale(subscription.values, factors) : zeros,
+        pct: subscription
+          ? pctOfRevenue(scale(subscription.values, factors), netRevenue)
+          : pctOfRevenue(zeros, netRevenue),
+      },
+    ],
+  };
+
+  return {
+    id: "revenue",
+    label: "Net Revenue",
+    kind: "line",
+    values: netRevenue,
+    pct: pctRev,
+    children: [orgPaidBucket, dirSubBucket],
+  };
+}
+
+function buildSessionsNode(parsed: ParsedPnL, n: number): PlNode | null {
+  const s = (parsed as any).sessions;
+  if (!s) return null;
+
+  const zeros = Array<number>(n).fill(0);
+  const blanks = Array<number>(n).fill(NaN);
+
+  return {
+    id: "sessions",
+    label: "Sessions",
+    kind: "line",
+    values: s.total,
+    pct: blanks,
+    children: [
+      {
+        id: "sessions_browser",
+        label: "Browser Sessions",
+        kind: "line",
+        values: s.browser ?? zeros,
+        pct: blanks,
+      },
+      {
+        id: "sessions_mobile",
+        label: "Mobile App Sessions",
+        kind: "line",
+        values: s.mobile ?? zeros,
+        pct: blanks,
+      },
+      {
+        id: "sessions_active_subs",
+        label: "Active subscriptions (SnS)",
+        kind: "line",
+        values: intN(s.activeSubs, n),
+        pct: blanks,
+      },
+    ],
+  };
+}
+
+function buildUspNode(parsed: ParsedPnL, n: number): PlNode | null {
+  const s = (parsed as any).sessions;
+  if (!s?.unitSessionPct) return null;
+  return {
+    id: "unit_session_pct",
+    label: "Unit Session %",
+    kind: "line",
+    values: s.unitSessionPct,
+    pct: Array<number>(n).fill(NaN),
+  };
+}
+
+function buildUnitsNode(
+  unitsRoot: RawLine | null,
+  unitsChildren: RawLine[],
+  refundsUnitsLine: RawLine | null,
+  n: number
+): PlNode | null {
+  if (!unitsRoot) return null;
+
+  const zeros = Array<number>(n).fill(0);
+  const blanks = Array<number>(n).fill(NaN);
+
+  const organic = pickOrganic(unitsChildren);
+  const sp = pickSponsored(unitsChildren, "products");
+  const sb = pickSponsored(unitsChildren, "brands");
+  const sd = pickSponsored(unitsChildren, "display");
+
+  const direct = pickDirectUnits(unitsChildren);
+  const subscription = pickSubscriptionUnits(unitsChildren);
+
+  const denom = unitsRoot.values;
+  const pctOfUnits = (values: number[]) => values.map((v, i) => (denom[i] ? v / denom[i] : NaN));
+
+  const orgPaidBucket: PlNode = {
+    id: "units_org_paid_bucket",
+    label: "Organic / Paid",
+    kind: "line",
+    values: blanks,
+    pct: blanks,
+    children: [
+      {
+        id: "units_organic",
+        label: "Organic",
+        kind: "line",
+        values: organic ? organic.values : zeros,
+        pct: pctOfUnits(organic ? organic.values : zeros),
+      },
+      {
+        id: "units_sp",
+        label: "Sponsored Products",
+        kind: "line",
+        values: sp ? sp.values : zeros,
+        pct: pctOfUnits(sp ? sp.values : zeros),
+      },
+      {
+        id: "units_sb",
+        label: "Sponsored Brands",
+        kind: "line",
+        values: sb ? sb.values : zeros,
+        pct: pctOfUnits(sb ? sb.values : zeros),
+      },
+      {
+        id: "units_sd",
+        label: "Sponsored Display",
+        kind: "line",
+        values: sd ? sd.values : zeros,
+        pct: pctOfUnits(sd ? sd.values : zeros),
+      },
+    ],
+  };
+
+  const dirSubBucket: PlNode = {
+    id: "units_dir_sub_bucket",
+    label: "Direct / Subscription",
+    kind: "line",
+    values: blanks,
+    pct: blanks,
+    children: [
+      {
+        id: "units_direct",
+        label: "Direct",
+        kind: "line",
+        values: direct ? direct.values : zeros,
+        pct: pctOfUnits(direct ? direct.values : zeros),
+      },
+      {
+        id: "units_subscription",
+        label: "Subscription",
+        kind: "line",
+        values: subscription ? subscription.values : zeros,
+        pct: pctOfUnits(subscription ? subscription.values : zeros),
+      },
+    ],
+  };
+
+  const refundsValues = refundsUnitsLine ? refundsUnitsLine.values : zeros;
+
+  const refundsNode: PlNode = {
+    id: "units_refunds",
+    label: "Refunds",
+    kind: "line",
+    values: refundsValues,
+    pct: pctOfUnits(refundsValues),
+  };
+
+  return {
+    id: "units",
+    label: "Units",
+    kind: "line",
+    values: denom,
+    pct: blanks,
+    children: [orgPaidBucket, dirSubBucket, refundsNode],
+  };
+}
+
+function buildAspNode(grossRevenue: number[], unitsRoot: RawLine | null, n: number): PlNode | null {
+  if (!unitsRoot) return null;
+
+  const asp = grossRevenue.map((r, i) => {
+    const u = unitsRoot.values[i] ?? 0;
+    return u ? r / u : 0;
+  });
+
+  return {
+    id: "asp",
+    label: "ASP",
+    kind: "line",
+    values: asp,
+    pct: Array<number>(n).fill(NaN),
+  };
+}
+
+function costGroup(id: string, label: string, lines: RawLine[], revenue: number[], n: number): PlNode {
+  const total = sumN(lines, n);
   return {
     id,
     label,
@@ -316,344 +677,9 @@ function extractRefundCostBlock(all: RawLine[]) {
   return { refundLines, remaining };
 }
 
-function dropAggregateVatLine(vatLines: RawLine[]) {
-  if (vatLines.length < 3) return vatLines;
-
-  const absSumOthers = (idx: number) => {
-    const out = [0, 0, 0, 0];
-    for (let i = 0; i < vatLines.length; i++) {
-      if (i === idx) continue;
-      const v = abs4(vatLines[i].values);
-      for (let k = 0; k < 4; k++) out[k] += v[k] ?? 0;
-    }
-    return out;
-  };
-
-  const approxEq = (a: number[], b: number[], tol = 0.01) =>
-    a.every((av, i) => Math.abs((av ?? 0) - (b[i] ?? 0)) <= tol);
-
-  const candidates = vatLines
-    .map((l, idx) => ({ l, idx }))
-    .filter(({ l }) => norm(l.name) === "vat" && !isIndented(l.name));
-
-  for (const c of candidates) {
-    const cand = abs4(c.l.values);
-    const others = absSumOthers(c.idx);
-    if (approxEq(cand, others)) {
-      return vatLines.filter((_, i) => i !== c.idx);
-    }
-  }
-
-  for (let i = 0; i < vatLines.length; i++) {
-    const cand = abs4(vatLines[i].values);
-    const others = absSumOthers(i);
-    if (approxEq(cand, others)) {
-      return vatLines.filter((_, j) => j !== i);
-    }
-  }
-
-  return vatLines;
-}
-
-function buildVatNode(vatLines: RawLine[], netRevenue: number[]): PlNode {
-  const filtered = dropAggregateVatLine(vatLines);
-  const totalRaw = sum4(filtered);
-  const total = abs4(totalRaw);
-
-  return {
-    id: "vat",
-    label: "VAT",
-    kind: "line",
-    values: total,
-    pct: pctOfRevenue(total, netRevenue),
-    children: filtered.map((l, idx) => ({
-      id: `vat_${idx}`,
-      label: l.name,
-      kind: "line",
-      values: abs4(l.values),
-      pct: pctOfRevenue(abs4(l.values), netRevenue),
-    })),
-  };
-}
-
-function buildGrossRevenueNode(grossRevenue: number[], netRevenue: number[], vatNode: PlNode): PlNode {
-  return {
-    id: "gross_revenue",
-    label: "Gross Revenue",
-    kind: "line",
-    values: grossRevenue,
-    pct: BLANKS,
-    children: [
-      {
-        id: "gross_revenue_net",
-        label: "Net Revenue",
-        kind: "line",
-        values: netRevenue,
-        pct: pctOfRevenue(netRevenue, netRevenue),
-      },
-      vatNode,
-    ],
-  };
-}
-
-function scale4(values: number[], factors: number[]) {
-  return values.map((v, i) => (Number.isFinite(v) ? v * (factors[i] ?? 0) : 0));
-}
-
-function buildRevenueNode(netRevenue: number[], salesChildrenGross: RawLine[], grossRevenue: number[]): PlNode {
-  // We only have a gross breakdown in Sellerboard.
-  // To keep children summing to Net Revenue, scale each child by (net/gross) per period.
-  const factors = grossRevenue.map((g, i) => {
-    const gg = g ?? 0;
-    const nn = netRevenue[i] ?? 0;
-    return gg ? nn / gg : 0;
-  });
-
-  const organic = pickOrganic(salesChildrenGross);
-  const sp = pickSponsored(salesChildrenGross, "products");
-  const sb = pickSponsored(salesChildrenGross, "brands");
-  const sd = pickSponsored(salesChildrenGross, "display");
-
-  const direct = pickDirectSales(salesChildrenGross);
-  const subscription = pickSubscriptionSales(salesChildrenGross);
-
-  const pctRev = pctOfRevenue(netRevenue, netRevenue);
-
-  const orgPaidBucket: PlNode = {
-    id: "rev_org_paid_bucket",
-    label: "Organic / Paid",
-    kind: "line",
-    values: BLANKS,
-    pct: BLANKS,
-    children: [
-      {
-        id: "rev_organic",
-        label: "Organic",
-        kind: "line",
-        values: organic ? scale4(organic.values, factors) : ZEROS,
-        pct: organic ? pctOfRevenue(scale4(organic.values, factors), netRevenue) : pctOfRevenue(ZEROS, netRevenue),
-      },
-      {
-        id: "rev_sp",
-        label: "Sponsored Products",
-        kind: "line",
-        values: sp ? scale4(sp.values, factors) : ZEROS,
-        pct: sp ? pctOfRevenue(scale4(sp.values, factors), netRevenue) : pctOfRevenue(ZEROS, netRevenue),
-      },
-      {
-        id: "rev_sb",
-        label: "Sponsored Brands",
-        kind: "line",
-        values: sb ? scale4(sb.values, factors) : ZEROS,
-        pct: sb ? pctOfRevenue(scale4(sb.values, factors), netRevenue) : pctOfRevenue(ZEROS, netRevenue),
-      },
-      {
-        id: "rev_sd",
-        label: "Sponsored Display",
-        kind: "line",
-        values: sd ? scale4(sd.values, factors) : ZEROS,
-        pct: sd ? pctOfRevenue(scale4(sd.values, factors), netRevenue) : pctOfRevenue(ZEROS, netRevenue),
-      },
-    ],
-  };
-
-  const dirSubBucket: PlNode = {
-    id: "rev_dir_sub_bucket",
-    label: "Direct / Subscription",
-    kind: "line",
-    values: BLANKS,
-    pct: BLANKS,
-    children: [
-      {
-        id: "rev_direct",
-        label: "Direct",
-        kind: "line",
-        values: direct ? scale4(direct.values, factors) : ZEROS,
-        pct: direct ? pctOfRevenue(scale4(direct.values, factors), netRevenue) : pctOfRevenue(ZEROS, netRevenue),
-      },
-      {
-        id: "rev_subscription",
-        label: "Subscription",
-        kind: "line",
-        values: subscription ? scale4(subscription.values, factors) : ZEROS,
-        pct: subscription
-          ? pctOfRevenue(scale4(subscription.values, factors), netRevenue)
-          : pctOfRevenue(ZEROS, netRevenue),
-      },
-    ],
-  };
-
-  return {
-    id: "revenue",
-    label: "Net Revenue",
-    kind: "line",
-    values: netRevenue,
-    pct: pctRev,
-    children: [orgPaidBucket, dirSubBucket],
-  };
-}
-
-function buildSessionsNode(parsed: ParsedPnL): PlNode | null {
-  const s = (parsed as any).sessions;
-  if (!s) return null;
-
-  return {
-    id: "sessions",
-    label: "Sessions",
-    kind: "line",
-    values: s.total,
-    pct: BLANKS,
-    children: [
-      {
-        id: "sessions_browser",
-        label: "Browser Sessions",
-        kind: "line",
-        values: s.browser ?? ZEROS,
-        pct: BLANKS,
-      },
-      {
-        id: "sessions_mobile",
-        label: "Mobile App Sessions",
-        kind: "line",
-        values: s.mobile ?? ZEROS,
-        pct: BLANKS,
-      },
-      // last + integer values
-      {
-        id: "sessions_active_subs",
-        label: "Active subscriptions (SnS)",
-        kind: "line",
-        values: int4(s.activeSubs),
-        pct: BLANKS,
-      },
-    ],
-  };
-}
-
-function buildUspNode(parsed: ParsedPnL): PlNode | null {
-  const s = (parsed as any).sessions;
-  if (!s?.unitSessionPct) return null;
-  return {
-    id: "unit_session_pct",
-    label: "Unit Session %",
-    kind: "line",
-    values: s.unitSessionPct,
-    pct: BLANKS,
-  };
-}
-
-function buildUnitsNode(
-  unitsRoot: RawLine | null,
-  unitsChildren: RawLine[],
-  refundsUnitsLine: RawLine | null
-): PlNode | null {
-  if (!unitsRoot) return null;
-
-  const organic = pickOrganic(unitsChildren);
-  const sp = pickSponsored(unitsChildren, "products");
-  const sb = pickSponsored(unitsChildren, "brands");
-  const sd = pickSponsored(unitsChildren, "display");
-
-  const direct = pickDirectUnits(unitsChildren);
-  const subscription = pickSubscriptionUnits(unitsChildren);
-
-  const denom = unitsRoot.values;
-  const pctOfUnits = (values: number[]) => values.map((v, i) => (denom[i] ? v / denom[i] : NaN));
-
-  const orgPaidBucket: PlNode = {
-    id: "units_org_paid_bucket",
-    label: "Organic / Paid",
-    kind: "line",
-    values: BLANKS,
-    pct: BLANKS,
-    children: [
-      {
-        id: "units_organic",
-        label: "Organic",
-        kind: "line",
-        values: organic ? organic.values : ZEROS,
-        pct: pctOfUnits(organic ? organic.values : ZEROS),
-      },
-      {
-        id: "units_sp",
-        label: "Sponsored Products",
-        kind: "line",
-        values: sp ? sp.values : ZEROS,
-        pct: pctOfUnits(sp ? sp.values : ZEROS),
-      },
-      {
-        id: "units_sb",
-        label: "Sponsored Brands",
-        kind: "line",
-        values: sb ? sb.values : ZEROS,
-        pct: pctOfUnits(sb ? sb.values : ZEROS),
-      },
-      {
-        id: "units_sd",
-        label: "Sponsored Display",
-        kind: "line",
-        values: sd ? sd.values : ZEROS,
-        pct: pctOfUnits(sd ? sd.values : ZEROS),
-      },
-    ],
-  };
-
-  const dirSubBucket: PlNode = {
-    id: "units_dir_sub_bucket",
-    label: "Direct / Subscription",
-    kind: "line",
-    values: BLANKS,
-    pct: BLANKS,
-    children: [
-      {
-        id: "units_direct",
-        label: "Direct",
-        kind: "line",
-        values: direct ? direct.values : ZEROS,
-        pct: pctOfUnits(direct ? direct.values : ZEROS),
-      },
-      {
-        id: "units_subscription",
-        label: "Subscription",
-        kind: "line",
-        values: subscription ? subscription.values : ZEROS,
-        pct: pctOfUnits(subscription ? subscription.values : ZEROS),
-      },
-    ],
-  };
-
-  const refundsValues = refundsUnitsLine ? refundsUnitsLine.values : ZEROS;
-
-  const refundsNode: PlNode = {
-    id: "units_refunds",
-    label: "Refunds",
-    kind: "line",
-    values: refundsValues,
-    pct: pctOfUnits(refundsValues),
-  };
-
-  return {
-    id: "units",
-    label: "Units",
-    kind: "line",
-    values: denom,
-    pct: BLANKS,
-    children: [orgPaidBucket, dirSubBucket, refundsNode],
-  };
-}
-
-function buildAspNode(grossRevenue: number[], unitsRoot: RawLine | null): PlNode | null {
-  if (!unitsRoot) return null;
-
-  const asp = grossRevenue.map((r, i) => {
-    const u = unitsRoot.values[i] ?? 0;
-    return u ? r / u : 0;
-  });
-
-  return { id: "asp", label: "ASP", kind: "line", values: asp, pct: BLANKS };
-}
-
 export function buildPlTree(parsed: ParsedPnL): PlNode[] {
+  const n = parsed.periods.length;
+
   // Sales + Units blocks
   const { children: salesChildren, remaining: afterSales } = extractTopLevelBlock(parsed.lines, "sales");
   const { root: unitsRoot, children: unitsChildren, remaining } = extractTopLevelBlock(afterSales, "units");
@@ -666,24 +692,23 @@ export function buildPlTree(parsed: ParsedPnL): PlNode[] {
   const remainingNoVat = remaining.filter((l) => !norm(l.name).includes("vat"));
 
   // Build VAT values first (pct will be computed once we have net revenue)
-  // buildVatNode needs netRevenue denominator, but netRevenue depends on VAT totals.
-  const vatNodeTmp = buildVatNode(vatLines, grossRevenue); // temporary denom; we'll fix pct after netRevenue exists
+  const vatNodeTmp = buildVatNode(vatLines, grossRevenue, n); // temporary denom; fixed after netRevenue
   const vatTotal = vatNodeTmp.values;
 
   // NET = GROSS - VAT
   const netRevenue = grossRevenue.map((g, i) => (g ?? 0) - (vatTotal[i] ?? 0));
 
   // Rebuild VAT node with correct denom (net revenue)
-  const vatNode = buildVatNode(vatLines, netRevenue);
+  const vatNode = buildVatNode(vatLines, netRevenue, n);
 
   // Gross Revenue node: Gross -> (Net + VAT)
-  const grossRevenueNode = buildGrossRevenueNode(grossRevenue, netRevenue, vatNode);
+  const grossRevenueNode = buildGrossRevenueNode(grossRevenue, netRevenue, vatNode, n);
 
   // Refund block extraction (removes parent + children from remaining)
   const { refundLines, remaining: remainingNoVatNoRefunds } = extractRefundCostBlock(remainingNoVat);
 
-  const sessionsNode = buildSessionsNode(parsed);
-  const uspNode = buildUspNode(parsed);
+  const sessionsNode = buildSessionsNode(parsed, n);
+  const uspNode = buildUspNode(parsed, n);
 
   // Buckets
   const byBucket: Record<BucketId, RawLine[]> = {
@@ -711,22 +736,22 @@ export function buildPlTree(parsed: ParsedPnL): PlNode[] {
   }
 
   // Pricing and margin waterfall (anchor on NET revenue)
-  const pricingCosts = sum4(byBucket.pricing);
+  const pricingCosts = sumN(byBucket.pricing, n);
   const grossMargin = netRevenue.map((v, i) => (v ?? 0) + (pricingCosts[i] ?? 0));
 
-  const refundTotal = sum4(byBucket.refunds);
+  const refundTotal = sumN(byBucket.refunds, n);
   const gmAfterRefunds = grossMargin.map((v, i) => (v ?? 0) + (refundTotal[i] ?? 0));
 
-  const promoTotal = sum4(byBucket.promo);
+  const promoTotal = sumN(byBucket.promo, n);
   const gmAfterPromo = gmAfterRefunds.map((v, i) => (v ?? 0) + (promoTotal[i] ?? 0));
 
-  const adsTotal = sum4(byBucket.ads);
+  const adsTotal = sumN(byBucket.ads, n);
   const gmAfterAds = gmAfterPromo.map((v, i) => (v ?? 0) + (adsTotal[i] ?? 0));
 
-  const storageTotal = sum4(byBucket.storage);
+  const storageTotal = sumN(byBucket.storage, n);
   const gmAfterStorage = gmAfterAds.map((v, i) => (v ?? 0) + (storageTotal[i] ?? 0));
 
-  const invTotal = sum4(byBucket.inventory);
+  const invTotal = sumN(byBucket.inventory, n);
   const gmAfterInv = gmAfterStorage.map((v, i) => (v ?? 0) + (invTotal[i] ?? 0));
 
   const grossPct = pctOfRevenue(grossMargin, netRevenue);
@@ -735,7 +760,7 @@ export function buildPlTree(parsed: ParsedPnL): PlNode[] {
   const adsPct = pctOfRevenue(adsTotal, netRevenue);
   const storagePct = pctOfRevenue(storageTotal, netRevenue);
 
-  const otherTotal = sum4(byBucket.other);
+  const otherTotal = sumN(byBucket.other, n);
   const otherPct = pctOfRevenue(otherTotal, netRevenue);
 
   // Net Margin = after inventory + other (unmapped)
@@ -743,41 +768,42 @@ export function buildPlTree(parsed: ParsedPnL): PlNode[] {
   const netMarginPct = pctOfRevenue(netMargin, netRevenue);
 
   // Revenue node (Net) with scaled children (so sums match)
-  const revenueNode = buildRevenueNode(netRevenue, salesChildren, grossRevenue);
+  const revenueNode = buildRevenueNode(netRevenue, salesChildren, grossRevenue, n);
 
   // Units + ASP
   const refundsUnitsLine =
     pickRefundUnits(unitsChildren) ?? parsed.lines.find((l) => norm(l.name) === "refunds") ?? null;
 
-  const unitsNode = buildUnitsNode(unitsRoot, unitsChildren, refundsUnitsLine);
+  const unitsNode = buildUnitsNode(unitsRoot, unitsChildren, refundsUnitsLine, n);
 
   // ASP should be based on GROSS revenue (unit price paid incl VAT)
-  const aspNode = buildAspNode(grossRevenue, unitsRoot);
+  const aspNode = buildAspNode(grossRevenue, unitsRoot, n);
 
   // Pricing children: COGS single line + Amazon Fees (everything else in pricing)
   const cogsLine = byBucket.pricing.find((l) => norm(l.name) === "cost of goods sold") ?? null;
   const amazonFeesLines = byBucket.pricing.filter((l) => norm(l.name) !== "cost of goods sold");
+  const zeros = Array<number>(n).fill(0);
 
   const pricingNode: PlNode = {
     id: "pricing",
     label: "Fixed fees",
     kind: "line",
-    values: sum4(byBucket.pricing),
-    pct: pctOfRevenue(sum4(byBucket.pricing), netRevenue),
+    values: sumN(byBucket.pricing, n),
+    pct: pctOfRevenue(sumN(byBucket.pricing, n), netRevenue),
     children: [
       {
         id: "pricing_cogs",
         label: "Cost of goods sold",
         kind: "line",
-        values: cogsLine ? cogsLine.values : ZEROS,
-        pct: pctOfRevenue(cogsLine ? cogsLine.values : ZEROS, netRevenue),
+        values: cogsLine ? cogsLine.values : zeros,
+        pct: pctOfRevenue(cogsLine ? cogsLine.values : zeros, netRevenue),
       },
       {
         id: "pricing_fees",
         label: "Amazon Fees",
         kind: "line",
-        values: sum4(amazonFeesLines),
-        pct: pctOfRevenue(sum4(amazonFeesLines), netRevenue),
+        values: sumN(amazonFeesLines, n),
+        pct: pctOfRevenue(sumN(amazonFeesLines, n), netRevenue),
         children: amazonFeesLines.map((l, idx) => ({
           id: `pricing_fee_${idx}`,
           label: l.name,
@@ -802,19 +828,19 @@ export function buildPlTree(parsed: ParsedPnL): PlNode[] {
     pricingNode,
     subtotal("gm", "Gross Margin", grossMargin, grossPct),
 
-    costGroup("refunds", "Refunds", byBucket.refunds, netRevenue),
+    costGroup("refunds", "Refunds", byBucket.refunds, netRevenue, n),
     subtotal("gm_ref", "GM after Refunds", gmAfterRefunds, pctOfRevenue(gmAfterRefunds, netRevenue)),
 
-    costGroup("promo", "Promotions", byBucket.promo, netRevenue),
+    costGroup("promo", "Promotions", byBucket.promo, netRevenue, n),
     subtotal("gm_promo", "GM after Promo", gmAfterPromo, pctOfRevenue(gmAfterPromo, netRevenue)),
 
-    costGroup("ads", "Advertising", byBucket.ads, netRevenue),
+    costGroup("ads", "Advertising", byBucket.ads, netRevenue, n),
     subtotal("gm_ads", "GM after Adv.", gmAfterAds, pctOfRevenue(gmAfterAds, netRevenue)),
 
-    costGroup("storage", "Storage / LTS / removals", byBucket.storage, netRevenue),
+    costGroup("storage", "Storage / LTS / removals", byBucket.storage, netRevenue, n),
     subtotal("gm_storage", "GM after Str.", gmAfterStorage, pctOfRevenue(gmAfterStorage, netRevenue)),
 
-    costGroup("inventory", "Inventory Adjustments", byBucket.inventory, netRevenue),
+    costGroup("inventory", "Inventory Adjustments", byBucket.inventory, netRevenue, n),
     subtotal("gm_inventory", "GM after Inv. Adj.", gmAfterInv, pctOfRevenue(gmAfterInv, netRevenue)),
 
     {
@@ -835,7 +861,7 @@ export function buildPlTree(parsed: ParsedPnL): PlNode[] {
     subtotal("net_margin", "Net Margin", netMargin, netMarginPct),
   ];
 
-  // Benchmarks (based on NET revenue anchor)
+  // Benchmarks (based on NET revenue anchor, most recent period = index 0)
   applyBench(tree, "Gross Margin", "grossMargin", grossPct);
   applyBench(tree, "Refunds", "refunds", refundsPct);
   applyBench(tree, "Promotions (Coup/Deal/Vine)", "promo", promoPct);
@@ -844,7 +870,8 @@ export function buildPlTree(parsed: ParsedPnL): PlNode[] {
 
   const otherNode = tree.find((x) => x.id === "other");
   if (otherNode) {
-    const p = Math.abs(otherPct[3] ?? 0);
+    // Index 0 = most recent period
+    const p = Math.abs(otherPct[0] ?? 0);
     if (p >= 0.01) {
       otherNode.status = p >= 0.03 ? "bad" : "watch";
       otherNode.flags = [p >= 0.03 ? "too much unmapped cost" : "some unmapped lines"];
