@@ -253,19 +253,19 @@ export default function PlPage() {
   const [error, setError] = useState<string | null>(null);
 
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [visiblePeriods, setVisiblePeriods] = useState<number>(4);
 
   const periods = session.periods ?? [];
   const tree = session.tree ?? [];
   const cadence = session.cadence ?? "period";
 
-  const hasData = periods.length === 4 && tree.length > 0;
+  const hasData = periods.length > 0 && tree.length > 0;
 
-  const rangeLabel =
-    cadence === "week"
-      ? "Last 4 weeks"
-      : cadence === "month"
-      ? "Last 4 months"
-      : "Last 4 periods";
+  const displayPeriods = periods.slice(0, visiblePeriods);
+
+  const totalPeriods = periods.length;
+  const periodWord = cadence === "week" ? "weeks" : cadence === "month" ? "months" : "periods";
+  const rangeLabel = `Last ${totalPeriods} ${periodWord} P&L`;
 
   async function onFiles(files: FileList | null) {
     const file = files?.[0];
@@ -345,19 +345,38 @@ export default function PlPage() {
           <div className="border-b p-5">
             <div className="flex items-center justify-between gap-4">
               <div>
-                <div className="text-lg font-semibold">{rangeLabel} P&L</div>
+                <div className="text-lg font-semibold">{rangeLabel}</div>
               </div>
             </div>
+          </div>
+
+          <div className="px-5 pt-4 pb-2 flex items-center gap-3 border-b">
+            <label className="text-sm font-medium text-gray-600" htmlFor="period-count-select">
+              Show periods:
+            </label>
+            <select
+              id="period-count-select"
+              value={visiblePeriods === Infinity ? "all" : String(visiblePeriods)}
+              onChange={(e) =>
+                setVisiblePeriods(e.target.value === "all" ? Infinity : Number(e.target.value))
+              }
+              className="rounded-lg border px-2.5 py-1.5 text-sm font-medium bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-gray-300"
+            >
+              <option value="4">4</option>
+              <option value="8">8</option>
+              <option value="12">12</option>
+              <option value="all">All</option>
+            </select>
           </div>
 
           <div className="p-5 overflow-x-auto">
             <table className="w-full table-fixed text-sm">
               <colgroup>
                 <col style={{ width: COL_LINE_W }} />
-                {periods.map((p) => (
+                {displayPeriods.map((p) => (
                   <col key={p.key} style={{ width: COL_W }} />
                 ))}
-                {periods.map((p) => (
+                {displayPeriods.map((p) => (
                   <col key={p.key + "_pct"} style={{ width: COL_W }} />
                 ))}
                 <col style={{ width: COL_BENCH_W }} />
@@ -372,7 +391,7 @@ export default function PlPage() {
                     Line
                   </th>
 
-                  {periods.map((p) => {
+                  {displayPeriods.map((p) => {
                     const h = formatPeriodHeader(p.label, cadence);
                     return (
                       <th
@@ -385,7 +404,7 @@ export default function PlPage() {
                     );
                   })}
 
-                  {periods.map((p) => (
+                  {displayPeriods.map((p) => (
                     <th
                       key={p.key + "_pct"}
                       className="py-1.5 px-2 text-right font-semibold text-gray-500 whitespace-normal leading-tight"
@@ -408,6 +427,7 @@ export default function PlPage() {
                     collapsed={collapsed}
                     onToggle={toggle}
                     lastWeekIndex={LAST_WEEK_INDEX}
+                    numPeriods={displayPeriods.length}
                   />
                 ))}
               </tbody>
@@ -426,6 +446,7 @@ function Row({
   collapsed,
   onToggle,
   lastWeekIndex,
+  numPeriods,
 }: {
   node: any;
   level: number;
@@ -433,6 +454,7 @@ function Row({
   collapsed: Record<string, boolean>;
   onToggle: (id: string) => void;
   lastWeekIndex: number;
+  numPeriods: number;
 }) {
   const pad = level === 0 ? "pl-0" : level === 1 ? "pl-6" : "pl-10";
   const isGroup = Array.isArray(node.children) && node.children.length > 0;
@@ -530,7 +552,7 @@ function Row({
           </div>
         </td>
 
-        {node.values.map((v: number, i: number) => (
+        {(node.values as number[]).slice(0, numPeriods).map((v: number, i: number) => (
           <td
             key={i}
             className={`py-1.5 px-2 text-right tabular-nums ${
@@ -549,7 +571,7 @@ function Row({
           </td>
         ))}
 
-        {node.pct.map((p: number, i: number) => (
+        {(node.pct as number[]).slice(0, numPeriods).map((p: number, i: number) => (
           <td
             key={i}
             className={`py-1.5 px-2 text-right tabular-nums ${
@@ -584,6 +606,7 @@ function Row({
             collapsed={collapsed}
             onToggle={onToggle}
             lastWeekIndex={lastWeekIndex}
+            numPeriods={numPeriods}
           />
         ))}
     </>
