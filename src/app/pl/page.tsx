@@ -315,8 +315,10 @@ export default function PlPage() {
   // Sellerboard periods are displayed newest -> oldest, so latest period is index 0
   const LAST_WEEK_INDEX = 0;
 
+  const tableMinWidth = COL_LINE_W + displayPeriods.length * COL_W * 2 + COL_BENCH_W;
+
   return (
-    <div className="mx-auto max-w-6xl p-6">
+    <div className="p-6">
       <div className="mb-5 flex items-start justify-between gap-4">
         <div>
           <div className="text-2xl font-semibold">P&amp;L Analyzer</div>
@@ -370,7 +372,7 @@ export default function PlPage() {
           </div>
 
           <div className="p-5 overflow-x-auto">
-            <table className="w-full table-fixed text-sm">
+            <table className="w-full table-fixed text-sm" style={{ minWidth: tableMinWidth }}>
               <colgroup>
                 <col style={{ width: COL_LINE_W }} />
                 {displayPeriods.map((p) => (
